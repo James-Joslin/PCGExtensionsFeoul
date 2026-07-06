@@ -468,6 +468,9 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 			FTransform Transform;
 			float Density;
 			FSoftObjectPath MeshPath;
+			// Source point's metadata entry — the output entry is parented to this so
+			// inherited attributes (Biome_*, etc.) survive through the node.
+			int64 SourceMetaEntry = PCGInvalidEntryKey;
 		};
 		TArray<FInstance> Instances;
 		Instances.Reserve(NumCandidates);
@@ -484,7 +487,9 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 			const FTransform& CandTransform = InTransforms[Idx];
 			const FVector CandPos = CandTransform.GetLocation();
 
-			const int32 PointSeed = PCGHelpers::ComputeSeed(BaseSeed, InSeeds[Idx] + Idx);
+			// Hash rather than add: InSeeds[Idx] + Idx could overflow int32 (UB) and
+			// collide for symmetric seed/index pairs.
+			const int32 PointSeed = PCGHelpers::ComputeSeed(BaseSeed, InSeeds[Idx], Idx);
 			FRandomStream Rng(PointSeed);
 
 			auto Reject = [&]()
@@ -580,6 +585,7 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 			Inst.Transform = FTransform(Rot, FinalPos, FVector(FinalScale));
 			Inst.Density = Settings->bWriteDensity ? Keep : InDensities[Idx];
 			Inst.MeshPath = Chosen.MeshPath;
+			Inst.SourceMetaEntry = InMetadataEntries[Idx];
 
 			if (MinDist > 0.0f)
 			{
@@ -625,8 +631,14 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 				OutSteepness[i] = 1.0f;
 				OutSeeds[i] = PCGHelpers::ComputeSeedFromPosition(Inst.Transform.GetLocation());
 
-				// Fresh metadata entry per instance for the mesh path.
-				OutMetadataEntries[i] = PCGInvalidEntryKey;
+				// BUGFIX: previously PCGInvalidEntryKey → InitializeOnSet created an
+				// UNPARENTED entry, so every inherited attribute (Biome_Forest,
+				// Biome_Default, ...) reverted to its attribute DEFAULT value on
+				// output, breaking any downstream node reading biome weights.
+				// Seeding with the source point's entry parents the new local entry
+				// to it (OutData's metadata is initialised from InData), preserving
+				// all per-point attribute values alongside the mesh path.
+				OutMetadataEntries[i] = Inst.SourceMetaEntry;
 				OutMeta->InitializeOnSet(OutMetadataEntries[i]);
 				if (MeshPathAttr)
 				{

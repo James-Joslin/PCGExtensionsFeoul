@@ -6,8 +6,9 @@
 // GroundCoverScatter, which read these weights in ComputeBiomeFactors().
 //
 // Workflow:
-//   1. Place closed-loop spline actors in the level, each with an Actor Tag
-//      matching a BiomeEntry (e.g. tag = "Forest").
+//   1. Place closed-loop spline actors in the level, each with a Tag matching
+//      a BiomeEntry (e.g. tag = "Forest"). Both Actor Tags (Details → Actor →
+//      Tags) and Component Tags on the spline component are accepted.
 //   2. In the PCG graph: Surface Sampler → candidate points → In pin.
 //   3. Get Spline Data (or Get Actor Data) → Splines pin.
 //   4. This node writes Biome_Forest, Biome_Meadow, ... as float metadata.
@@ -55,11 +56,11 @@ struct PCGEXTENSIONS_API FPCGBiomeMaskEntry
 	GENERATED_BODY()
 
 	/**
-	 * Actor Tag on the source spline actor in the level (e.g. "Forest").
-	 * The node matches each incoming spline to a biome entry by checking
-	 * if the spline's source actor has this tag.  Falls back to checking
-	 * the FPCGTaggedData tags (set via PCG graph Tag nodes) if the actor
-	 * reference is unavailable.
+	 * Tag on the source spline actor in the level (e.g. "Forest").
+	 * Matched against the actor's Actor Tags AND its components' Component
+	 * Tags (so tagging the Spline component inside a Blueprint works too).
+	 * Falls back to checking the FPCGTaggedData tags (set via PCG graph Tag
+	 * nodes) if the actor reference is unavailable.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome")
 	FName SplineActorTag = FName(TEXT("Forest"));
@@ -151,6 +152,22 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome Mask")
 	bool bNormaliseWeights = true;
+
+	/**
+	 * Also write a residual weight attribute = 1 - Σ(biome weights): how strongly
+	 * "no biome" (default terrain) this point is. Use this instead of a Create
+	 * Constant + Subtract chain in the graph — it stays correct automatically when
+	 * more biomes are added, and its attribute default of 0.0 means missing/broken
+	 * metadata downstream reads as "no biome data" rather than masquerading as
+	 * pure default biome.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome Mask")
+	bool bEmitResidualWeight = false;
+
+	/** Attribute name for the residual weight (e.g. "Biome_Default"). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome Mask",
+		meta = (EditCondition = "bEmitResidualWeight"))
+	FName ResidualAttributeName = FName(TEXT("Biome_Default"));
 
 	// ── Spline Sampling ───────────────────────────────────────────
 

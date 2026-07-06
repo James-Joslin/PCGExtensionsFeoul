@@ -2,9 +2,10 @@
 // Custom PCG node that places one vegetation tier (large trees, medium trees,
 // shrubs, ...) from an input candidate point cloud. Does the heavy per-point
 // lifting: landscape projection, slope-band filtering, per-biome density/scale
-// response read from weight attributes, mesh-bounds obstacle exclusion (avoids
-// rock faces / larger tiers), single-layer noise thinning, min-distance pruning,
-// weighted mesh assignment, and optional companion (understory) output.
+// response read from weight attributes, single-layer noise thinning,
+// min-distance pruning, weighted mesh assignment, and optional companion
+// (understory) output. Per-point metadata (e.g. biome weight attributes) is
+// preserved on the Out and Companions pins for downstream nodes.
 //
 // Designed to be instanced once per tier and configured entirely in the Details
 // panel. Candidate generation and valley/volume subtraction are done upstream
@@ -12,7 +13,7 @@
 // subtraction), then fed into the In pin.
 //
 // Replaces the chain: Surface Sampler → Normal To Density → Density Filter →
-// Density Noise → Self Pruning → (manual exclusion) → Transform Points.
+// Density Noise → Self Pruning → Transform Points.
 //
 // Place in your project's Source/<Module>/Public/ directory.
 // Requires "PCG" in Build.cs PublicDependencyModuleNames.
@@ -93,11 +94,9 @@ struct PCGEXTENSIONS_API FPCGVegBiomeResponse
 //  Settings
 // ─────────────────────────────────────────────
 
-// TODO(audit): The class summary above and the node tooltip below both advertise
-// "mesh-bounds obstacle exclusion" (avoids rock faces / larger tiers). That feature
-// does not exist -- the only implementation was a commented-out stub in the .cpp,
-// which has been removed. Owner must either implement the exclusion feature or strip
-// the claims from the summary, the node tooltip, and the Out-pin tooltip.
+// NOTE: mesh-bounds obstacle exclusion was previously advertised but never
+// implemented; all references to it have been removed from the documentation.
+// If the feature is added later, reinstate an "Exclusion Sources" input pin.
 UCLASS(BlueprintType, ClassGroup = (Procedural))
 class PCGEXTENSIONS_API UPCGTieredVegetationScatterSettings : public UPCGSettings
 {
@@ -118,10 +117,11 @@ public:
 		return NSLOCTEXT("PCGTieredVegetationScatter", "Tooltip",
 			"Places one vegetation tier from input candidate points. Projects onto the "
 			"landscape, filters by slope band, modulates density/scale per biome (read from "
-			"weight attributes), excludes points inside rock/obstacle mesh footprints, applies "
-			"a noise cluster mask, prunes by minimum distance, assigns a weighted mesh (stored "
-			"as a MeshPath attribute), and optionally emits companion/understory points. "
-			"Instance once per tier and configure in the Details panel.");
+			"weight attributes), applies a noise cluster mask, prunes by minimum distance, "
+			"assigns a weighted mesh (stored as a MeshPath attribute), and optionally emits "
+			"companion/understory points. Per-point metadata (biome weights etc.) is "
+			"preserved on the outputs. Instance once per tier and configure in the Details "
+			"panel.");
 	}
 	virtual EPCGSettingsType GetType() const override { return EPCGSettingsType::PointOps; }
 #endif
@@ -239,10 +239,19 @@ public:
 
 	/**
 	 * Attribute the chosen mesh path is written to. Use a By-Attribute Static Mesh
-	 * Spawner downstream. This output can also feed the NEXT tier's Exclusion Sources.
+	 * Spawner downstream.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh Set")
 	FName MeshPathAttributeName = FName(TEXT("MeshPath"));
+
+	/**
+	 * Write the final keep probability into each output point's Density. Useful for
+	 * visualisation/debugging, but beware: downstream nodes that sample density
+	 * (e.g. spawner density-as-probability modes, Density Filter) will apply a
+	 * SECOND round of thinning. Disable to output Density = 1.0.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh Set")
+	bool bWriteKeepProbabilityAsDensity = true;
 
 	// ── Transform Randomisation ───────────────────────────────────
 
@@ -264,7 +273,8 @@ public:
 	 * Emit a ring of understory points around each accepted instance (e.g. shrubs around
 	 * big trees). Output is transform-ready but mesh-less — assign shrub meshes downstream
 	 * with a Spawner, or pipe into Scatter Around Points for richer control. Companions
-	 * inherit slope, exclusion and projection.
+	 * inherit slope filtering, projection, and the primary's per-point metadata
+	 * (biome weights).
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions")
 	bool bGenerateCompanions = false;

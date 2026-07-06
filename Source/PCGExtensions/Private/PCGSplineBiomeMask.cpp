@@ -13,6 +13,7 @@
 #include "Metadata/PCGMetadataAttribute.h"
 #include "Helpers/PCGHelpers.h"
 #include "GameFramework/Actor.h"
+#include "Components/ActorComponent.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(PCGSplineBiomeMask)
 
@@ -113,7 +114,7 @@ TArray<FVector2D> FPCGSplineBiomeMaskElement::SampleSplineToPolyline(
 		return Points;
 	}
 
-	Points.Reserve(NumSegments * SamplesPerSegment);
+	Points.Reserve(NumSegments * SamplesPerSegment + 1);
 
 	for (int32 Seg = 0; Seg < NumSegments; ++Seg)
 	{
@@ -127,6 +128,20 @@ TArray<FVector2D> FPCGSplineBiomeMaskElement::SampleSplineToPolyline(
 			const FVector Loc = T.GetLocation();
 			Points.Add(FVector2D(Loc.X, Loc.Y));
 		}
+	}
+
+	// BUGFIX: each segment samples S = 0 .. SamplesPerSegment-1, so a segment's
+	// endpoint is only covered by the NEXT segment's start sample. That is correct
+	// for closed loops (the last segment wraps to the first point), but for OPEN
+	// splines the true final control point was dropped entirely, distorting the
+	// implicit closing chord. Append it explicitly.
+	if (!SplineData->SplineStruct.bClosedLoop && NumSegments > 0)
+	{
+		const int32 LastSeg = NumSegments - 1;
+		const FTransform TEnd = SplineData->GetTransformAtDistance(
+			LastSeg, SplineData->GetSegmentLength(LastSeg), /*bWorldSpace=*/true);
+		const FVector EndLoc = TEnd.GetLocation();
+		Points.Add(FVector2D(EndLoc.X, EndLoc.Y));
 	}
 
 	return Points;
@@ -308,7 +323,27 @@ bool FPCGSplineBiomeMaskElement::ExecuteInternal(FPCGContext* Context) const
 		{
 			for (int32 Idx = 0; Idx < NumBiomes; ++Idx)
 			{
-				if (SourceActor->ActorHasTag(Settings->BiomeEntries[Idx].SplineActorTag))
+				const FName& Tag = Settings->BiomeEntries[Idx].SplineActorTag;
+
+				// BUGFIX: ActorHasTag only checks the ACTOR's Tags array. Tags placed
+				// on the spline COMPONENT inside a Blueprint (a very easy mistake —
+				// the Details "Tags" field on a selected component is a Component
+				// Tag) were invisible, so those splines silently fell into the
+				// unmatched bucket. Accept component tags as well.
+				bool bMatch = SourceActor->ActorHasTag(Tag);
+				if (!bMatch)
+				{
+					for (const UActorComponent* Comp : SourceActor->GetComponents())
+					{
+						if (Comp && Comp->ComponentHasTag(Tag))
+						{
+							bMatch = true;
+							break;
+						}
+					}
+				}
+
+				if (bMatch)
 				{
 					MatchIdx = Idx;
 					break;
@@ -347,6 +382,22 @@ bool FPCGSplineBiomeMaskElement::ExecuteInternal(FPCGContext* Context) const
 			}
 #endif
 			continue;
+		}
+
+		// Open (non-closed-loop) splines are implicitly closed with a straight
+		// chord by the geometry tests — almost never the intent for a biome
+		// boundary. Warn loudly so a forgotten "Closed Loop" checkbox on the
+		// spline component doesn't silently produce a mangled polygon.
+		if (!SplineData->SplineStruct.bClosedLoop)
+		{
+			AActor* WarnActor = SplineData->TargetActor.Get();
+			PCGE_LOG(Warning, GraphAndLog, FText::Format(
+				NSLOCTEXT("PCGSplineBiomeMask", "OpenSpline",
+					"Spline Biome Mask: Spline from actor \"{0}\" is not a closed loop. "
+					"The polygon will be closed with a straight chord between its "
+					"endpoints — enable 'Closed Loop' on the spline component if this "
+					"is a biome boundary."),
+				FText::FromString(WarnActor ? WarnActor->GetActorNameOrLabel() : TEXT("<no actor ref>"))));
 		}
 
 		// Sample the spline into an XY polyline.
@@ -450,6 +501,18 @@ bool FPCGSplineBiomeMaskElement::ExecuteInternal(FPCGContext* Context) const
 				/*bAllowInterpolation=*/true, /*bOverrideParent=*/true);
 		}
 
+		// Optional residual attribute: 1 - Σ(biome weights), i.e. how "default"
+		// this point is. Replaces the fragile Create Constant + Subtract graph
+		// pattern (whose attribute DEFAULT of 1.0 can camouflage metadata bugs
+		// downstream by making broken points look like pure default biome).
+		FPCGMetadataAttribute<float>* ResidualAttr = nullptr;
+		if (Settings->bEmitResidualWeight && !Settings->ResidualAttributeName.IsNone())
+		{
+			ResidualAttr = OutMeta->FindOrCreateAttribute<float>(
+				Settings->ResidualAttributeName, 0.0f,
+				/*bAllowInterpolation=*/true, /*bOverrideParent=*/true);
+		}
+
 		// ── Per-point biome weight computation ──
 #if WITH_EDITOR
 		TArray<int32> InsideCounts;
@@ -467,11 +530,13 @@ bool FPCGSplineBiomeMaskElement::ExecuteInternal(FPCGContext* Context) const
 			const FVector Pos = Point.Transform.GetLocation();
 			const FVector2D PosXY(Pos.X, Pos.Y);
 
-			// Ensure the point has its own metadata entry for writing.
-			if (Point.MetadataEntry == PCGInvalidEntryKey)
-			{
-				Point.MetadataEntry = OutMeta->AddEntry();
-			}
+			// Localise the metadata entry before writing. InitializeOnSet handles
+			// both cases correctly: an invalid key gets a fresh entry; a key that
+			// belongs to the PARENT metadata gets a new local entry parented to it.
+			// (Previously we wrote attribute values against parent-owned keys —
+			// it happened to work, but it's the inverse of the sanctioned pattern
+			// and fragile across engine versions.)
+			OutMeta->InitializeOnSet(Point.MetadataEntry);
 
 			// Compute weight for each biome.
 			for (int32 BiomeIdx = 0; BiomeIdx < NumBiomes; ++BiomeIdx)
@@ -551,6 +616,19 @@ bool FPCGSplineBiomeMaskElement::ExecuteInternal(FPCGContext* Context) const
 			for (int32 Idx = 0; Idx < NumBiomes; ++Idx)
 			{
 				BiomeAttrs[Idx]->SetValue(Point.MetadataEntry, Weights[Idx]);
+			}
+
+			// Residual = whatever weight is left over once all biomes have claimed
+			// theirs. With bNormaliseWeights on, Σ ≤ 1 is guaranteed post-scale.
+			if (ResidualAttr)
+			{
+				float Sum = 0.0f;
+				for (int32 Idx = 0; Idx < NumBiomes; ++Idx)
+				{
+					Sum += Weights[Idx];
+				}
+				ResidualAttr->SetValue(Point.MetadataEntry,
+					FMath::Clamp(1.0f - Sum, 0.0f, 1.0f));
 			}
 		}
 
