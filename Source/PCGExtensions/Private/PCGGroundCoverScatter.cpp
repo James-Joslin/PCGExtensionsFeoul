@@ -193,12 +193,37 @@ float FPCGGroundCoverScatterElement::ReadFloatAttr(
 		return Default;
 	}
 	const FPCGMetadataAttributeBase* Base = Meta->GetConstAttribute(Name);
-	if (!Base || Base->GetTypeId() != PCG::Private::MetadataTypes<float>::Id)
+	if (!Base)
 	{
 		return Default;
 	}
-	const FPCGMetadataAttribute<float>* Attr = static_cast<const FPCGMetadataAttribute<float>*>(Base);
-	return Attr->GetValueFromItemKey(EntryKey);
+
+	// BUGFIX: previously required EXACTLY float, silently returning Default (0)
+	// for double/int attributes — PCG's Create Constant / Attribute Maths nodes
+	// produce DOUBLE by default, so graph-authored weights read as 0 everywhere
+	// and the biome response collapsed to neutral. Accept common numeric types.
+	const int16 TypeId = Base->GetTypeId();
+	if (TypeId == PCG::Private::MetadataTypes<float>::Id)
+	{
+		return static_cast<const FPCGMetadataAttribute<float>*>(Base)->GetValueFromItemKey(EntryKey);
+	}
+	if (TypeId == PCG::Private::MetadataTypes<double>::Id)
+	{
+		return static_cast<float>(
+			static_cast<const FPCGMetadataAttribute<double>*>(Base)->GetValueFromItemKey(EntryKey));
+	}
+	if (TypeId == PCG::Private::MetadataTypes<int32>::Id)
+	{
+		return static_cast<float>(
+			static_cast<const FPCGMetadataAttribute<int32>*>(Base)->GetValueFromItemKey(EntryKey));
+	}
+	if (TypeId == PCG::Private::MetadataTypes<int64>::Id)
+	{
+		return static_cast<float>(
+			static_cast<const FPCGMetadataAttribute<int64>*>(Base)->GetValueFromItemKey(EntryKey));
+	}
+
+	return Default;
 }
 
 // ─────────────────────────────────────────────
@@ -439,6 +464,11 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 	const TArray<FPCGTaggedData> CandidateInputs =
 		Context->InputData.GetInputsByPin(PCGPinConstants::DefaultInputLabel);
 
+	// Validate the configured biome attributes once against the first real input,
+	// so misconfiguration (typo'd name, wrong attribute type) shows up as a graph
+	// warning instead of silently collapsing the biome response to neutral 1.0.
+	bool bValidatedBiomeAttrs = false;
+
 	// One output (and optional Rejected) per input data set -- initialised from THAT input's
 	// schema/metadata. Keying a single shared output to the first input drops the other inputs'
 	// attributes; per-input outputs preserve each input's biome/metadata parentage.
@@ -455,6 +485,45 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 			continue;
 		}
 		const UPCGMetadata* InMeta = InData->ConstMetadata();
+
+		if (!bValidatedBiomeAttrs && InMeta && Settings->BiomeResponses.Num() > 0)
+		{
+			bValidatedBiomeAttrs = true;
+			for (const FPCGGroundBiomeResponse& R : Settings->BiomeResponses)
+			{
+				if (R.BiomeAttribute.IsNone())
+				{
+					continue;
+				}
+				if (!InMeta->HasAttribute(R.BiomeAttribute))
+				{
+					PCGE_LOG(Warning, GraphAndLog, FText::Format(
+						NSLOCTEXT("PCGGroundCoverScatter", "MissingBiomeAttr",
+							"Ground Cover Scatter: BiomeResponse attribute \"{0}\" does not exist "
+							"on the input points. Its weight reads as 0 everywhere and the biome "
+							"response degrades toward neutral — check the attribute name against "
+							"the Spline Biome Mask output."),
+						FText::FromName(R.BiomeAttribute)));
+					continue;
+				}
+				const FPCGMetadataAttributeBase* Base = InMeta->GetConstAttribute(R.BiomeAttribute);
+				const int16 TypeId = Base ? Base->GetTypeId() : -1;
+				const bool bNumeric =
+					TypeId == PCG::Private::MetadataTypes<float>::Id ||
+					TypeId == PCG::Private::MetadataTypes<double>::Id ||
+					TypeId == PCG::Private::MetadataTypes<int32>::Id ||
+					TypeId == PCG::Private::MetadataTypes<int64>::Id;
+				if (!bNumeric)
+				{
+					PCGE_LOG(Warning, GraphAndLog, FText::Format(
+						NSLOCTEXT("PCGGroundCoverScatter", "BadBiomeAttrType",
+							"Ground Cover Scatter: BiomeResponse attribute \"{0}\" exists but is "
+							"not a numeric type (float/double/int32/int64). Its weight reads as 0 "
+							"everywhere."),
+						FText::FromName(R.BiomeAttribute)));
+				}
+			}
+		}
 
 		const TConstPCGValueRange<FTransform> InTransforms = InData->GetConstTransformValueRange();
 		const TConstPCGValueRange<int32> InSeeds = InData->GetConstSeedValueRange();
@@ -631,15 +700,21 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 				OutSteepness[i] = 1.0f;
 				OutSeeds[i] = PCGHelpers::ComputeSeedFromPosition(Inst.Transform.GetLocation());
 
-				// BUGFIX: previously PCGInvalidEntryKey → InitializeOnSet created an
-				// UNPARENTED entry, so every inherited attribute (Biome_Forest,
-				// Biome_Default, ...) reverted to its attribute DEFAULT value on
-				// output, breaking any downstream node reading biome weights.
-				// Seeding with the source point's entry parents the new local entry
-				// to it (OutData's metadata is initialised from InData), preserving
-				// all per-point attribute values alongside the mesh path.
-				OutMetadataEntries[i] = Inst.SourceMetaEntry;
-				OutMeta->InitializeOnSet(OutMetadataEntries[i]);
+				// Parent the new entry to the source point's entry so inherited
+				// attributes (Biome_*, etc.) survive through the node.
+				//
+				// CRASH FIX: never seed InitializeOnSet with a foreign key — its
+				// key-range heuristic leaves the key untouched (dangling) if the
+				// output metadata isn't actually parented to the input's. Verify
+				// the parent relationship and create the entry explicitly.
+				if (Inst.SourceMetaEntry != PCGInvalidEntryKey && OutMeta->GetParent() == InMeta)
+				{
+					OutMetadataEntries[i] = OutMeta->AddEntry(Inst.SourceMetaEntry);
+				}
+				else
+				{
+					OutMetadataEntries[i] = OutMeta->AddEntry();
+				}
 				if (MeshPathAttr)
 				{
 					MeshPathAttr->SetValue(OutMetadataEntries[i], Inst.MeshPath);

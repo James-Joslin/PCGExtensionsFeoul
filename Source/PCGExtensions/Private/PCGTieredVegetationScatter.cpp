@@ -125,13 +125,40 @@ float FPCGTieredVegetationScatterElement::ReadFloatAttr(
 	}
 
 	const FPCGMetadataAttributeBase* Base = Meta->GetConstAttribute(Name);
-	if (!Base || Base->GetTypeId() != PCG::Private::MetadataTypes<float>::Id)
+	if (!Base)
 	{
 		return Default;
 	}
 
-	const FPCGMetadataAttribute<float>* Attr = static_cast<const FPCGMetadataAttribute<float>*>(Base);
-	return Attr->GetValueFromItemKey(EntryKey);
+	// BUGFIX: this used to require the attribute to be EXACTLY float, silently
+	// returning Default (0) for anything else. PCG's Create Constant and
+	// Attribute Maths nodes produce DOUBLE by default, so a graph-authored
+	// weight like Biome_Default read as 0 at every point — and the
+	// WeightedAverage residual then quietly substituted a neutral density of
+	// 1.0, producing uniform scatter across the whole map. Accept any common
+	// numeric type instead.
+	const int16 TypeId = Base->GetTypeId();
+	if (TypeId == PCG::Private::MetadataTypes<float>::Id)
+	{
+		return static_cast<const FPCGMetadataAttribute<float>*>(Base)->GetValueFromItemKey(EntryKey);
+	}
+	if (TypeId == PCG::Private::MetadataTypes<double>::Id)
+	{
+		return static_cast<float>(
+			static_cast<const FPCGMetadataAttribute<double>*>(Base)->GetValueFromItemKey(EntryKey));
+	}
+	if (TypeId == PCG::Private::MetadataTypes<int32>::Id)
+	{
+		return static_cast<float>(
+			static_cast<const FPCGMetadataAttribute<int32>*>(Base)->GetValueFromItemKey(EntryKey));
+	}
+	if (TypeId == PCG::Private::MetadataTypes<int64>::Id)
+	{
+		return static_cast<float>(
+			static_cast<const FPCGMetadataAttribute<int64>*>(Base)->GetValueFromItemKey(EntryKey));
+	}
+
+	return Default;
 }
 
 void FPCGTieredVegetationScatterElement::ComputeBiomeFactors(
@@ -349,6 +376,11 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 	// different input data sets don't collide (the source point index resets per input).
 	int32 InputDataSetIndex = 0;
 
+	// Validate the configured biome attributes once against the first real input,
+	// so misconfiguration (typo'd name, wrong attribute type) shows up as a graph
+	// warning instead of silently collapsing the biome response to neutral 1.0.
+	bool bValidatedBiomeAttrs = false;
+
 	for (const FPCGTaggedData& Input : CandidateInputs)
 	{
 		const UPCGBasePointData* InData = Cast<UPCGBasePointData>(Input.Data);
@@ -367,6 +399,46 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 		const int32 InputSalt = InputDataSetIndex++;
 
 		const UPCGMetadata* InMeta = InData->ConstMetadata();
+
+		if (!bValidatedBiomeAttrs && InMeta && Settings->BiomeResponses.Num() > 0)
+		{
+			bValidatedBiomeAttrs = true;
+			for (const FPCGVegBiomeResponse& R : Settings->BiomeResponses)
+			{
+				if (R.BiomeAttribute.IsNone())
+				{
+					continue;
+				}
+				if (!InMeta->HasAttribute(R.BiomeAttribute))
+				{
+					PCGE_LOG(Warning, GraphAndLog, FText::Format(
+						NSLOCTEXT("PCGTieredVegetationScatter", "MissingBiomeAttr",
+							"Tiered Vegetation Scatter: BiomeResponse attribute \"{0}\" does not "
+							"exist on the input points. Its weight reads as 0 everywhere, and via "
+							"the WeightedAverage residual the biome response degrades toward "
+							"neutral density 1.0 — check the attribute name against the Spline "
+							"Biome Mask output."),
+						FText::FromName(R.BiomeAttribute)));
+					continue;
+				}
+				const FPCGMetadataAttributeBase* Base = InMeta->GetConstAttribute(R.BiomeAttribute);
+				const int16 TypeId = Base ? Base->GetTypeId() : -1;
+				const bool bNumeric =
+					TypeId == PCG::Private::MetadataTypes<float>::Id ||
+					TypeId == PCG::Private::MetadataTypes<double>::Id ||
+					TypeId == PCG::Private::MetadataTypes<int32>::Id ||
+					TypeId == PCG::Private::MetadataTypes<int64>::Id;
+				if (!bNumeric)
+				{
+					PCGE_LOG(Warning, GraphAndLog, FText::Format(
+						NSLOCTEXT("PCGTieredVegetationScatter", "BadBiomeAttrType",
+							"Tiered Vegetation Scatter: BiomeResponse attribute \"{0}\" exists but "
+							"is not a numeric type (float/double/int32/int64). Its weight reads as "
+							"0 everywhere."),
+						FText::FromName(R.BiomeAttribute)));
+				}
+			}
+		}
 
 		const TConstPCGValueRange<FTransform> InTransforms = InData->GetConstTransformValueRange();
 		const TConstPCGValueRange<int32> InSeeds = InData->GetConstSeedValueRange();
@@ -591,17 +663,25 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 				Seeds[i] = P.Seed;
 				Densities[i] = P.Density;
 
-				// BUGFIX: previously this was set to PCGInvalidEntryKey, which made
-				// InitializeOnSet create an UNPARENTED entry — every inherited
-				// attribute (Biome_Forest, Biome_Default, ...) silently reverted to
-				// its attribute DEFAULT value on output (e.g. Forest=0, Default=1),
-				// breaking any downstream node reading biome weights. Seeding the
-				// key with the source point's entry makes InitializeOnSet create a
-				// local entry parented to it (OutData's metadata is initialised from
-				// InData, so InMeta is OutMeta's parent), preserving all per-point
-				// attribute values.
-				MetaEntries[i] = P.SourceMetaEntry;
-				OutMeta->InitializeOnSet(MetaEntries[i]);
+				// Parent the new entry to the source point's entry so inherited
+				// attributes (Biome_*, etc.) survive through the node.
+				//
+				// CRASH FIX: do NOT seed InitializeOnSet with the source key. Its
+				// internal heuristic only re-parents keys that fall in the PARENT
+				// key range; if the engine didn't parent OutMeta to InMeta (this
+				// varies with FPCGInitializeFromDataParams behaviour across
+				// versions), the seeded key lands in the local range, is left
+				// untouched, and becomes a DANGLING entry key — the attribute
+				// inspector crashes dereferencing it. Verify the parent
+				// relationship explicitly and only then create a parented entry.
+				if (P.SourceMetaEntry != PCGInvalidEntryKey && OutMeta->GetParent() == InMeta)
+				{
+					MetaEntries[i] = OutMeta->AddEntry(P.SourceMetaEntry);
+				}
+				else
+				{
+					MetaEntries[i] = OutMeta->AddEntry();
+				}
 				if (MeshPathAttr)
 				{
 					MeshPathAttr->SetValue(MetaEntries[i], P.MeshPath);
@@ -640,13 +720,19 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 				Transforms[i] = StagedCompanions[i].Transform;
 				Seeds[i] = StagedCompanions[i].Seed;
 
-				// BUGFIX: companions previously carried NO metadata entry at all, so
-				// biome weight attributes were unreadable downstream (e.g. piping
-				// companions into GroundCoverScatter with BiomeResponses configured
-				// read attribute defaults for every point). Parent each companion to
-				// its spawning primary's source entry.
-				CompMetaEntries[i] = StagedCompanions[i].SourceMetaEntry;
-				CompMeta->InitializeOnSet(CompMetaEntries[i]);
+				// Companions inherit the spawning primary's source entry so biome
+				// weights remain readable downstream. Same explicit parent check as
+				// the primary flush — never seed InitializeOnSet with a foreign key
+				// (dangling-key crash risk if the metadata isn't parented).
+				if (StagedCompanions[i].SourceMetaEntry != PCGInvalidEntryKey &&
+					CompMeta->GetParent() == InMeta)
+				{
+					CompMetaEntries[i] = CompMeta->AddEntry(StagedCompanions[i].SourceMetaEntry);
+				}
+				else
+				{
+					CompMetaEntries[i] = CompMeta->AddEntry();
+				}
 			}
 
 			FPCGTaggedData& T = Outputs.Emplace_GetRef();
