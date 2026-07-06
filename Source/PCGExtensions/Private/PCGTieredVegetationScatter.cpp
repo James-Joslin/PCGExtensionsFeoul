@@ -45,8 +45,9 @@ TArray<FPCGPinProperties> UPCGTieredVegetationScatterSettings::OutputPinProperti
 		/*bAllowMultipleConnections=*/true,
 		/*bAllowMultipleData=*/true,
 		NSLOCTEXT("PCGTieredVegetationScatter", "OutTooltip",
-			"Placed instances with a MeshPath attribute. Feed a By-Attribute Static Mesh "
-			"Spawner, and/or this tier's Exclusion Sources for the next tier down."));
+			"Placed instances with a MeshPath attribute. Biome weight attributes from the "
+			"input points are preserved. Feed a By-Attribute Static Mesh Spawner and/or "
+			"further processing nodes."));
 
 	Pins.Emplace(PCGExtScatterCommon::CompanionsPinLabel,
 		EPCGDataType::Point,
@@ -124,13 +125,40 @@ float FPCGTieredVegetationScatterElement::ReadFloatAttr(
 	}
 
 	const FPCGMetadataAttributeBase* Base = Meta->GetConstAttribute(Name);
-	if (!Base || Base->GetTypeId() != PCG::Private::MetadataTypes<float>::Id)
+	if (!Base)
 	{
 		return Default;
 	}
 
-	const FPCGMetadataAttribute<float>* Attr = static_cast<const FPCGMetadataAttribute<float>*>(Base);
-	return Attr->GetValueFromItemKey(EntryKey);
+	// BUGFIX: this used to require the attribute to be EXACTLY float, silently
+	// returning Default (0) for anything else. PCG's Create Constant and
+	// Attribute Maths nodes produce DOUBLE by default, so a graph-authored
+	// weight like Biome_Default read as 0 at every point — and the
+	// WeightedAverage residual then quietly substituted a neutral density of
+	// 1.0, producing uniform scatter across the whole map. Accept any common
+	// numeric type instead.
+	const int16 TypeId = Base->GetTypeId();
+	if (TypeId == PCG::Private::MetadataTypes<float>::Id)
+	{
+		return static_cast<const FPCGMetadataAttribute<float>*>(Base)->GetValueFromItemKey(EntryKey);
+	}
+	if (TypeId == PCG::Private::MetadataTypes<double>::Id)
+	{
+		return static_cast<float>(
+			static_cast<const FPCGMetadataAttribute<double>*>(Base)->GetValueFromItemKey(EntryKey));
+	}
+	if (TypeId == PCG::Private::MetadataTypes<int32>::Id)
+	{
+		return static_cast<float>(
+			static_cast<const FPCGMetadataAttribute<int32>*>(Base)->GetValueFromItemKey(EntryKey));
+	}
+	if (TypeId == PCG::Private::MetadataTypes<int64>::Id)
+	{
+		return static_cast<float>(
+			static_cast<const FPCGMetadataAttribute<int64>*>(Base)->GetValueFromItemKey(EntryKey));
+	}
+
+	return Default;
 }
 
 void FPCGTieredVegetationScatterElement::ComputeBiomeFactors(
@@ -331,16 +359,27 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 		int32 Seed = 0;
 		float Density = 1.0f;
 		FSoftObjectPath MeshPath;
+		// Source point's metadata entry — the output entry is parented to this so
+		// inherited attributes (Biome_*, etc.) survive through the node.
+		int64 SourceMetaEntry = PCGInvalidEntryKey;
 	};
 	struct FStagedSimple
 	{
 		FTransform Transform;
 		int32 Seed = 0;
+		// Companions inherit the spawning primary's source entry so biome weights
+		// remain readable by downstream scatter nodes.
+		int64 SourceMetaEntry = PCGInvalidEntryKey;
 	};
 
 	// Fold a per-input-data-set counter into per-point seeds so points sourced from
 	// different input data sets don't collide (the source point index resets per input).
 	int32 InputDataSetIndex = 0;
+
+	// Validate the configured biome attributes once against the first real input,
+	// so misconfiguration (typo'd name, wrong attribute type) shows up as a graph
+	// warning instead of silently collapsing the biome response to neutral 1.0.
+	bool bValidatedBiomeAttrs = false;
 
 	for (const FPCGTaggedData& Input : CandidateInputs)
 	{
@@ -360,6 +399,46 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 		const int32 InputSalt = InputDataSetIndex++;
 
 		const UPCGMetadata* InMeta = InData->ConstMetadata();
+
+		if (!bValidatedBiomeAttrs && InMeta && Settings->BiomeResponses.Num() > 0)
+		{
+			bValidatedBiomeAttrs = true;
+			for (const FPCGVegBiomeResponse& R : Settings->BiomeResponses)
+			{
+				if (R.BiomeAttribute.IsNone())
+				{
+					continue;
+				}
+				if (!InMeta->HasAttribute(R.BiomeAttribute))
+				{
+					PCGE_LOG(Warning, GraphAndLog, FText::Format(
+						NSLOCTEXT("PCGTieredVegetationScatter", "MissingBiomeAttr",
+							"Tiered Vegetation Scatter: BiomeResponse attribute \"{0}\" does not "
+							"exist on the input points. Its weight reads as 0 everywhere, and via "
+							"the WeightedAverage residual the biome response degrades toward "
+							"neutral density 1.0 — check the attribute name against the Spline "
+							"Biome Mask output."),
+						FText::FromName(R.BiomeAttribute)));
+					continue;
+				}
+				const FPCGMetadataAttributeBase* Base = InMeta->GetConstAttribute(R.BiomeAttribute);
+				const int16 TypeId = Base ? Base->GetTypeId() : -1;
+				const bool bNumeric =
+					TypeId == PCG::Private::MetadataTypes<float>::Id ||
+					TypeId == PCG::Private::MetadataTypes<double>::Id ||
+					TypeId == PCG::Private::MetadataTypes<int32>::Id ||
+					TypeId == PCG::Private::MetadataTypes<int64>::Id;
+				if (!bNumeric)
+				{
+					PCGE_LOG(Warning, GraphAndLog, FText::Format(
+						NSLOCTEXT("PCGTieredVegetationScatter", "BadBiomeAttrType",
+							"Tiered Vegetation Scatter: BiomeResponse attribute \"{0}\" exists but "
+							"is not a numeric type (float/double/int32/int64). Its weight reads as "
+							"0 everywhere."),
+						FText::FromName(R.BiomeAttribute)));
+				}
+			}
+		}
 
 		const TConstPCGValueRange<FTransform> InTransforms = InData->GetConstTransformValueRange();
 		const TConstPCGValueRange<int32> InSeeds = InData->GetConstSeedValueRange();
@@ -385,7 +464,10 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 		{
 			const FVector CandPos = InTransforms[Idx].GetLocation();
 
-			const int32 PointSeed = PCGHelpers::ComputeSeed(BaseSeed, InSeeds[Idx] + Idx, InputSalt);
+			// Hash rather than add: InSeeds[Idx] + Idx could overflow int32 (UB) and
+			// collide for symmetric seed/index pairs.
+			const int32 PointSeed = PCGHelpers::ComputeSeed(
+				PCGHelpers::ComputeSeed(BaseSeed, InSeeds[Idx], Idx), InputSalt);
 			FRandomStream Rng(PointSeed);
 
 			// 1. Project onto the landscape.
@@ -405,6 +487,7 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 
 			// 3. Noise cluster gate.
 			float Noise = 1.0f;
+			float NoiseDensityFactor = 1.0f;
 			if (Settings->bUseNoiseMask)
 			{
 				Noise = Perlin01(ProjPos, Settings->NoiseFrequency, Settings->NoiseSeed);
@@ -417,6 +500,17 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 					Reject(Idx, ProjPos);
 					continue;
 				}
+
+				// Remap the surviving range [Threshold, 1] back to [0, 1] before it
+				// feeds the keep probability. Previously the RAW noise value was
+				// multiplied into Keep a second time after already gating, which
+				// silently scaled effective density inside clusters by ~Threshold–1.0
+				// (roughly halving it at the default 0.3 threshold). The remapped
+				// factor expresses "position within the cluster" instead: soft edges
+				// near the threshold, full density at cluster cores.
+				NoiseDensityFactor = (Settings->NoiseThreshold < 1.0f - KINDA_SMALL_NUMBER)
+					? (Noise - Settings->NoiseThreshold) / (1.0f - Settings->NoiseThreshold)
+					: 1.0f;
 			}
 
 			// 4. Biome response.
@@ -425,11 +519,8 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 				InMeta, InMetaEntries[Idx], BiomeDensity, BiomeScale);
 
 			// 6. Density roll.
-			// TODO(audit): noise is applied twice -- once as the hard gate in step 3, and
-			// again here as a multiplier into the keep probability. Confirm with the owner
-			// whether the second application is intentional (left unchanged for now).
 			const float Keep = FMath::Clamp(
-				Settings->KeepProbability * Noise * BiomeDensity, 0.0f, 1.0f);
+				Settings->KeepProbability * NoiseDensityFactor * BiomeDensity, 0.0f, 1.0f);
 			if (Rng.FRand() > Keep)
 			{
 				Reject(Idx, ProjPos);
@@ -466,8 +557,12 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 			FStagedPrimary Primary;
 			Primary.Transform = FTransform(Rot, FinalPos, FVector(FinalScale));
 			Primary.Seed = PointSeed;
-			Primary.Density = Keep;
+			// Writing the keep probability as Density can cause a SECOND round of
+			// stochastic thinning in downstream nodes that sample density; only do
+			// so when explicitly requested.
+			Primary.Density = Settings->bWriteKeepProbabilityAsDensity ? Keep : 1.0f;
 			Primary.MeshPath = Chosen.MeshPath;
+			Primary.SourceMetaEntry = InMetaEntries[Idx];
 			StagedPrimaries.Add(Primary);
 
 			AcceptedGrid.Add(ProjPos);
@@ -525,6 +620,7 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 						CompPos + FVector(0.0, 0.0, Settings->CompanionZOffset),
 						FVector(CompScale));
 					Comp.Seed = CompSeed;
+					Comp.SourceMetaEntry = InMetaEntries[Idx];
 					StagedCompanions.Add(Comp);
 
 					CompanionGrid.Add(CompPos);
@@ -567,8 +663,25 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 				Seeds[i] = P.Seed;
 				Densities[i] = P.Density;
 
-				MetaEntries[i] = PCGInvalidEntryKey;
-				OutMeta->InitializeOnSet(MetaEntries[i]);
+				// Parent the new entry to the source point's entry so inherited
+				// attributes (Biome_*, etc.) survive through the node.
+				//
+				// CRASH FIX: do NOT seed InitializeOnSet with the source key. Its
+				// internal heuristic only re-parents keys that fall in the PARENT
+				// key range; if the engine didn't parent OutMeta to InMeta (this
+				// varies with FPCGInitializeFromDataParams behaviour across
+				// versions), the seeded key lands in the local range, is left
+				// untouched, and becomes a DANGLING entry key — the attribute
+				// inspector crashes dereferencing it. Verify the parent
+				// relationship explicitly and only then create a parented entry.
+				if (P.SourceMetaEntry != PCGInvalidEntryKey && OutMeta->GetParent() == InMeta)
+				{
+					MetaEntries[i] = OutMeta->AddEntry(P.SourceMetaEntry);
+				}
+				else
+				{
+					MetaEntries[i] = OutMeta->AddEntry();
+				}
 				if (MeshPathAttr)
 				{
 					MeshPathAttr->SetValue(MetaEntries[i], P.MeshPath);
@@ -590,18 +703,36 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 			CompData->AllocateProperties(
 				EPCGPointNativeProperties::Transform | EPCGPointNativeProperties::Seed |
 				EPCGPointNativeProperties::Density | EPCGPointNativeProperties::Steepness |
-				EPCGPointNativeProperties::BoundsMin | EPCGPointNativeProperties::BoundsMax);
+				EPCGPointNativeProperties::BoundsMin | EPCGPointNativeProperties::BoundsMax |
+				EPCGPointNativeProperties::MetadataEntry);
 			CompData->SetDensity(1.0f);
 			CompData->SetSteepness(1.0f);
 			CompData->SetExtents(FVector(30.0f));
 
+			UPCGMetadata* CompMeta = CompData->MutableMetadata();
+
 			TPCGValueRange<FTransform> Transforms = CompData->GetTransformValueRange();
 			TPCGValueRange<int32> Seeds = CompData->GetSeedValueRange();
+			TPCGValueRange<int64> CompMetaEntries = CompData->GetMetadataEntryValueRange();
 
 			for (int32 i = 0; i < StagedCompanions.Num(); ++i)
 			{
 				Transforms[i] = StagedCompanions[i].Transform;
 				Seeds[i] = StagedCompanions[i].Seed;
+
+				// Companions inherit the spawning primary's source entry so biome
+				// weights remain readable downstream. Same explicit parent check as
+				// the primary flush — never seed InitializeOnSet with a foreign key
+				// (dangling-key crash risk if the metadata isn't parented).
+				if (StagedCompanions[i].SourceMetaEntry != PCGInvalidEntryKey &&
+					CompMeta->GetParent() == InMeta)
+				{
+					CompMetaEntries[i] = CompMeta->AddEntry(StagedCompanions[i].SourceMetaEntry);
+				}
+				else
+				{
+					CompMetaEntries[i] = CompMeta->AddEntry();
+				}
 			}
 
 			FPCGTaggedData& T = Outputs.Emplace_GetRef();
@@ -613,6 +744,13 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 		// their projected surface position (debug only).
 		if (Settings->bOutputRejected && RejectedReadIndices.Num() > 0)
 		{
+			// These are parallel arrays filled together in Reject(); a desync here
+			// (e.g. a future reject path pushing only one of them) would silently
+			// relocate the wrong points below.
+			ensureMsgf(RejectedReadIndices.Num() == RejectedPositions.Num(),
+				TEXT("TieredVegetationScatter: rejected index/position arrays out of sync (%d vs %d)."),
+				RejectedReadIndices.Num(), RejectedPositions.Num());
+
 			UPCGBasePointData* RejData = FPCGContext::NewPointData_AnyThread(Context);
 			FPCGInitializeFromDataParams InitParams(InData);
 			RejData->InitializeFromDataWithParams(InitParams);
